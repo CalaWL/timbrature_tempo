@@ -19,7 +19,7 @@ jobs:
 
       - name: Build exe
         run: |
-          pyinstaller --onefile --windowed timbrature.py
+          pyinstaller --onefile --windowed --icon icon.ico --add-data "icon.png;." timbrature.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
