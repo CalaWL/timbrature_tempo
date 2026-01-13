@@ -1,11 +1,16 @@
 import json
 import os
+import sys
 from datetime import datetime, date, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 DEFAULT_WORK_HHMM = "08:00"
+MIN_LUNCH_BREAK = timedelta(minutes=45)
 
+# -------------------------
+# Paths / persistence
+# -------------------------
 def user_state_path(app_name="TimbratureTool"):
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     folder = os.path.join(base, app_name)
@@ -14,6 +19,17 @@ def user_state_path(app_name="TimbratureTool"):
 
 STATE_FILE = user_state_path()
 
+def resource_path(relative_path: str) -> str:
+    """
+    Ritorna il path di una risorsa sia in sviluppo che quando 'frozen' (PyInstaller).
+    """
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, relative_path)  # type: ignore[attr-defined]
+    return os.path.join(os.path.abspath("."), relative_path)
+
+# -------------------------
+# Parsing / formatting
+# -------------------------
 def parse_hhmm_time(s: str):
     s = s.strip()
     if not s:
@@ -24,10 +40,6 @@ def parse_hhmm_time(s: str):
         return None
 
 def parse_hhmm_duration(s: str):
-    """
-    Parse durata in formato HH:MM -> timedelta
-    Accetta 0<=HH, 0<=MM<60
-    """
     s = s.strip()
     if not s:
         return None
@@ -68,11 +80,50 @@ def save_state(state):
 def today_key():
     return date.today().isoformat()
 
+def normalize_time_text(text: str) -> str:
+    """
+    Normalizza input orario:
+    - "0830" -> "08:30"
+    - "830"  -> "08:30"
+    - "8:30" non viene accettato da parse strict, ma puoi scrivere "08:30"
+    - se già "HH:MM" valido, lascia com'è
+    """
+    s = (text or "").strip()
+    if not s:
+        return s
+
+    # Già nel formato HH:MM
+    if parse_hhmm_time(s) is not None:
+        return s
+
+    # Solo цифre: 3 o 4
+    if s.isdigit() and len(s) in (3, 4):
+        if len(s) == 3:
+            s = "0" + s  # "830" -> "0830"
+        hh = int(s[:2])
+        mm = int(s[2:])
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+
+    return text.strip()
+
+# -------------------------
+# App
+# -------------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Calcolo uscita (ore giornaliere)")
         self.resizable(False, False)
+
+        # Icona finestra (PNG)
+        try:
+            icon_file = resource_path("icon.png")
+            if os.path.exists(icon_file):
+                self._icon_img = tk.PhotoImage(file=icon_file)  # keep reference
+                self.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
 
         self.state_data = load_state()
         self.day = today_key()
@@ -86,19 +137,32 @@ class App(tk.Tk):
 
         ttk.Label(frm, text="Ore giornaliere (HH:MM)").grid(row=1, column=0, sticky="w")
         self.work_var = tk.StringVar(value=day_state.get("ore_giornaliere", DEFAULT_WORK_HHMM))
-        ttk.Entry(frm, textvariable=self.work_var, width=10).grid(row=1, column=1, sticky="w")
+        work_entry = ttk.Entry(frm, textvariable=self.work_var, width=10)
+        work_entry.grid(row=1, column=1, sticky="w")
 
         ttk.Label(frm, text="Ingresso (HH:MM)").grid(row=2, column=0, sticky="w")
         self.in_var = tk.StringVar(value=day_state.get("ingresso", ""))
-        ttk.Entry(frm, textvariable=self.in_var, width=10).grid(row=2, column=1, sticky="w")
+        in_entry = ttk.Entry(frm, textvariable=self.in_var, width=10)
+        in_entry.grid(row=2, column=1, sticky="w")
 
         ttk.Label(frm, text="Uscita pranzo (HH:MM)").grid(row=3, column=0, sticky="w")
         self.out_lunch_var = tk.StringVar(value=day_state.get("uscita_pranzo", ""))
-        ttk.Entry(frm, textvariable=self.out_lunch_var, width=10).grid(row=3, column=1, sticky="w")
+        out_l_entry = ttk.Entry(frm, textvariable=self.out_lunch_var, width=10)
+        out_l_entry.grid(row=3, column=1, sticky="w")
 
         ttk.Label(frm, text="Rientro pranzo (HH:MM)").grid(row=4, column=0, sticky="w")
         self.in_lunch_var = tk.StringVar(value=day_state.get("rientro_pranzo", ""))
-        ttk.Entry(frm, textvariable=self.in_lunch_var, width=10).grid(row=4, column=1, sticky="w")
+        in_l_entry = ttk.Entry(frm, textvariable=self.in_lunch_var, width=10)
+        in_l_entry.grid(row=4, column=1, sticky="w")
+
+        # Auto-formattazione "0830" -> "08:30" quando esci dal campo
+        for entry, var in [
+            (in_entry, self.in_var),
+            (out_l_entry, self.out_lunch_var),
+            (in_l_entry, self.in_lunch_var),
+        ]:
+            entry.bind("<FocusOut>", lambda _e, v=var: self._normalize_var(v))
+            entry.bind("<Return>",  lambda _e, v=var: self._normalize_var(v))
 
         btns = ttk.Frame(frm)
         btns.grid(row=5, column=0, columnspan=2, pady=(10, 0), sticky="w")
@@ -117,10 +181,18 @@ class App(tk.Tk):
 
         self.try_autocalc()
 
+    def _normalize_var(self, var: tk.StringVar):
+        var.set(normalize_time_text(var.get()))
+
     def validate_inputs(self):
         work = parse_hhmm_duration(self.work_var.get())
         if work is None or work <= timedelta(0):
             return None, None, None, None, "Inserisci 'Ore giornaliere' valide (HH:MM), es. 08:00."
+
+        # normalizza prima di validare
+        self._normalize_var(self.in_var)
+        self._normalize_var(self.out_lunch_var)
+        self._normalize_var(self.in_lunch_var)
 
         t_in = parse_hhmm_time(self.in_var.get())
         t_out_l = parse_hhmm_time(self.out_lunch_var.get())
@@ -142,6 +214,11 @@ class App(tk.Tk):
         return work, t_in, t_out_l, t_in_l, None
 
     def on_save(self):
+        # normalizza sempre prima di salvare
+        self._normalize_var(self.in_var)
+        self._normalize_var(self.out_lunch_var)
+        self._normalize_var(self.in_lunch_var)
+
         work = parse_hhmm_duration(self.work_var.get())
         if work is None or work <= timedelta(0):
             messagebox.showerror("Errore", "Inserisci 'Ore giornaliere' valide (HH:MM), es. 08:00.")
@@ -154,9 +231,11 @@ class App(tk.Tk):
         if parse_hhmm_time(t_in_raw) is None:
             messagebox.showerror("Errore", "Inserisci un orario di ingresso valido (HH:MM).")
             return
+
         if (t_out_l_raw and parse_hhmm_time(t_out_l_raw) is None) or (t_in_l_raw and parse_hhmm_time(t_in_l_raw) is None):
-            messagebox.showerror("Errore", "Formato orario non valido. Usa HH:MM (es. 08:15).")
+            messagebox.showerror("Errore", "Formato orario non valido. Usa HH:MM (es. 08:15) o 0815.")
             return
+
         if (t_out_l_raw == "" and t_in_l_raw != "") or (t_out_l_raw != "" and t_in_l_raw == ""):
             messagebox.showerror("Errore", "Compila entrambi gli orari del pranzo oppure lasciali vuoti.")
             return
@@ -188,23 +267,59 @@ class App(tk.Tk):
                 messagebox.showerror("Errore", "Durata mattina negativa: controlla gli orari.")
                 return
 
+            actual_break = dt_in_l - dt_out_l
+            if actual_break < timedelta(0):
+                messagebox.showerror("Errore", "Pausa pranzo negativa: controlla gli orari.")
+                return
+
+            # Pausa minima 45 minuti: se più breve, aggiungi delta
+            extra_break_needed = timedelta(0)
+            effective_break = actual_break
+            note_parts = []
+
+            if actual_break < MIN_LUNCH_BREAK:
+                extra_break_needed = MIN_LUNCH_BREAK - actual_break
+                effective_break = MIN_LUNCH_BREAK
+                note_parts.append(f"Pausa minima {fmt_td(MIN_LUNCH_BREAK)}: aggiunti +{fmt_td(extra_break_needed)}")
+
             remaining = work - morning_work
-            exit_time = dt_in_l + remaining
-            pause = dt_in_l - dt_out_l
+            exit_time = dt_in_l + remaining + extra_break_needed
 
             self.result_lbl.config(text=f"Uscita prevista: {exit_time.strftime('%H:%M')}")
-            self.detail_lbl.config(
-                text=f"Target: {fmt_td(work)} | Mattina: {fmt_td(morning_work)} | Pausa: {fmt_td(pause)} | Pomeriggio richiesto: {fmt_td(remaining)}"
+
+            details = (
+                f"Target: {fmt_td(work)} | Mattina: {fmt_td(morning_work)} | "
+                f"Pausa: {fmt_td(actual_break)}"
             )
+            if extra_break_needed > timedelta(0):
+                details += f" (effettiva: {fmt_td(effective_break)})"
+            details += f" | Pomeriggio richiesto: {fmt_td(remaining)}"
+
+            if note_parts:
+                details += " | Nota: " + "; ".join(note_parts)
+
+            self.detail_lbl.config(text=details)
+
         else:
+            # se non hai ancora pranzo, stima fine lavoro dal solo ingresso
             exit_time = dt_in + work
             self.result_lbl.config(text=f"Uscita prevista (senza pausa): {exit_time.strftime('%H:%M')}")
-            self.detail_lbl.config(text=f"Target: {fmt_td(work)} | Inserisci gli orari del pranzo per il calcolo definitivo.")
+            self.detail_lbl.config(
+                text=f"Target: {fmt_td(work)} | Inserisci gli orari del pranzo per il calcolo definitivo (pausa minima {fmt_td(MIN_LUNCH_BREAK)})."
+            )
 
     def try_autocalc(self):
         work = parse_hhmm_duration(self.work_var.get())
+        if not work:
+            return
+
+        # normalizza prima del calcolo automatico
+        self._normalize_var(self.in_var)
+        self._normalize_var(self.out_lunch_var)
+        self._normalize_var(self.in_lunch_var)
+
         t_in = parse_hhmm_time(self.in_var.get())
-        if not work or not t_in:
+        if not t_in:
             return
         t_out_l = parse_hhmm_time(self.out_lunch_var.get())
         t_in_l = parse_hhmm_time(self.in_lunch_var.get())
@@ -216,18 +331,34 @@ class App(tk.Tk):
             if t_out_l and t_in_l:
                 dt_out_l = dt_today(t_out_l)
                 dt_in_l = dt_today(t_in_l)
+
                 morning_work = dt_out_l - dt_in
+                actual_break = dt_in_l - dt_out_l
+
+                extra_break_needed = timedelta(0)
+                note_parts = []
+                if actual_break < MIN_LUNCH_BREAK:
+                    extra_break_needed = MIN_LUNCH_BREAK - actual_break
+                    note_parts.append(f"Pausa minima {fmt_td(MIN_LUNCH_BREAK)}: +{fmt_td(extra_break_needed)}")
+
                 remaining = work - morning_work
-                exit_time = dt_in_l + remaining
-                pause = dt_in_l - dt_out_l
+                exit_time = dt_in_l + remaining + extra_break_needed
+
                 self.result_lbl.config(text=f"Uscita prevista: {exit_time.strftime('%H:%M')}")
-                self.detail_lbl.config(
-                    text=f"Target: {fmt_td(work)} | Mattina: {fmt_td(morning_work)} | Pausa: {fmt_td(pause)} | Pomeriggio richiesto: {fmt_td(remaining)}"
+
+                details = (
+                    f"Target: {fmt_td(work)} | Mattina: {fmt_td(morning_work)} | "
+                    f"Pausa: {fmt_td(actual_break)} | Pomeriggio richiesto: {fmt_td(remaining)}"
                 )
+                if note_parts:
+                    details += " | Nota: " + "; ".join(note_parts)
+                self.detail_lbl.config(text=details)
             else:
                 exit_time = dt_in + work
                 self.result_lbl.config(text=f"Uscita prevista (senza pausa): {exit_time.strftime('%H:%M')}")
-                self.detail_lbl.config(text=f"Target: {fmt_td(work)} | Inserisci gli orari del pranzo per il calcolo definitivo.")
+                self.detail_lbl.config(
+                    text=f"Target: {fmt_td(work)} | Inserisci gli orari del pranzo per il calcolo definitivo (pausa minima {fmt_td(MIN_LUNCH_BREAK)})."
+                )
         except Exception:
             pass
 
